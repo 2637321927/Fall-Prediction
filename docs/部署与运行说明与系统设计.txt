@@ -1,0 +1,376 @@
+防跌倒人体检测系统
+部署与运行说明 + 系统设计与技术开发文档
+
+本部分说明如何把防跌倒人体检测系统从零部署运行起来，每一步写清操作命令与应该看到的输出；随后给出系统设计、模块划分与技术要点。
+
+
+第一部分 部署与运行说明
+========================================
+
+
+一、环境要求
+
+1.操作系统：Windows 10/11 或 Linux，均可运行（命令以 Windows 为例）。
+2.GPU：NVIDIA 显卡，建议显存 4GB 以上，并安装与 PyTorch 匹配的 CUDA 驱动（CUDA 11.8 及以上）。
+3.Python 环境：使用 Anaconda/Miniconda 创建一个 conda 环境，安装以下依赖：
+   - PyTorch（CUDA 版，如 2.0.x+cu118）
+   - mmcv（完整编译版，需与 torch/cuda 版本匹配）
+   - mmdet、mmpose（姿态模型权重首次运行时自动下载）
+   本套代码对 conda 环境名、安装路径无任何要求，只要在对应环境内能正常 import 上述包即可。
+   每次运行前先激活环境：conda activate <环境名>
+   下文所有命令中的 python 均指该环境的解释器（未激活时可用该环境 python 的完整路径代替）。
+4.前端环境：Node.js 18+ 与 npm（仅运行前端时使用）。
+
+验证环境命令（应看到各版本号与 CUDA 可用）：
+  python -c "import torch,mmcv,mmdet,mmpose; print(torch.__version__, torch.cuda.is_available(), mmcv.__version__, mmpose.__version__)"
+预期输出（版本号依实际安装略有差异）：
+  2.0.1+cu118 True 2.1.0 1.3.0
+说明：True 表示 GPU 可用；若显示 False，说明 PyTorch 不是 CUDA 版，训练/推理会很慢。
+
+
+二、项目结构
+
+项目根目录
+  fall_detection/                跌倒检测算法工程
+    src/                         全部脚本（提取/标注/训练/推理）
+    data/keypoints/              关键点数据（279 段，xxx_keypoints.npy）
+    data/labels/                 帧级标签（279 段，xxx_labels.npy）
+    checkpoints/                 模型权重 + RTMPose 配置 + 评估指标
+    video/ + result/             测试视频（12 段）与推理结果
+    docs/                        文档（API、开发日志等）
+  CareWatch-Backend-main/        Web 后端（FastAPI 数据服务 + 内置推理）
+    app/                        后端代码（routes、models、action 推理模块）
+    run.py                      后端启动入口
+    inference_server.py         独立推理服务（可选架构）
+  Website/                      前端（Vue3 + Element Plus + Vite）
+  mmpose/                       mmpose 源码（开发模式，只读）
+
+
+三、数据准备
+
+数据流水线为：视频 → 关键点提取 → 标注 → 标签转换 → FPS 统一 → 训练。
+
+1.批量提取关键点（batch_extract.py）
+   作用：用 RTMDet 检测人体 + RTMPose 提取 17 个 COCO 关键点，保存为 (N,17,3) 的 npy（x,y,置信度）。
+   命令（在 fall_detection 目录下）：
+     python src\batch_extract.py --dir ..\..\fall\urfd --fps 0
+   参数说明：
+     --dir   视频目录（递归查找）
+     --fps   0=每帧提取；30=每秒抽 30 帧
+     --conf  关键点置信度阈值，默认 0.5
+     --exts  视频扩展名，默认 mp4（其余如 avi 跳过）
+   预期输出：
+     目录: ... 共 N 段视频
+     加载检测器... 加载姿态模型...（首次会下载 RTMDet 权重）
+     [1/N] xxx.mp4 → data/keypoints/xxx_keypoints.npy (共N帧)
+     ✅ 关键点: (M, 17, 3) → ... （每段约几秒到几十秒，取决于时长/分辨率）
+   产物：data/keypoints/xxx_keypoints.npy。
+
+2.交互式标注（label_video.py）
+   作用：播放视频，人工标记多段跌倒事件的 4 个时间点（R 失衡/F 下坠/I 触地/S 稳定），或标记为正常视频。
+   命令：
+     python src\label_video.py --video ..\video\CGFM1.mp4
+   操作键位：
+     空格 播放/暂停     ←→ 逐帧    + 新增事件    D 删除事件
+     R 标 risk_start   F 标 fall_start   I 标 impact   S 标 stable_fallen
+     N 清空（正常视频）  Q 保存退出
+   预期输出：弹出标注窗口，左侧显示视频与当前事件时间点，右侧列出事件列表；保存后打印：
+     `*_labels.npy`（0=正常 1=失衡 2=摔倒）+ `*_info.json`（标注详情）
+   产物：data/labels/xxx_labels.npy。
+
+3.标签转换（无需人工标注的数据集）
+   a) Pre-VFall 官方 CSV → 标签（convert_prevfall_labels.py）
+      命令：python src\convert_prevfall_labels.py
+      预期输出：CSV 视频数、每个视频帧数与标签分布（正常/失衡/摔倒帧数），跳过无关键点文件的视频。
+   b) 标注 xlsx → 帧级标签（make_labels_from_xlsx.py）
+      命令：python src\make_labels_from_xlsx.py --dry_run
+      预期输出：解析每个标注行，打印视频名与分段（起始帧+状态）；去掉 --dry_run 后写盘 labels.npy。
+
+4.FPS 统一（resample_labels.py）
+   作用：训练集要求帧率一致。把混合的 25/30fps 源统一时间重采样到 15fps，关键点与标签用同一时间网格对齐。
+   命令：
+     python src\resample_labels.py --orig_fps 30 --target_fps 15 --dry_run
+   说明：先 --dry_run 预览再正式跑；25fps 和 30fps 的源分两批分别指定 --orig_fps。
+   预期输出：每个视频重采样前后帧数变化（如 450 帧 → 225 帧）。
+   注意：重采样会覆盖 data/keypoints 与 data/labels，正式执行前建议备份。
+
+
+四、模型训练
+
+训练用滑动窗口切分（默认 window=30，@15fps 约 2 秒），支持 ST-GCN 与 TCN 两种时序模型。
+
+1.单次训练（train.py）
+   命令：
+     python src\train.py --model stgcn --features enhanced --window 30 --epochs 100 --num_classes 3
+   常用参数：
+     --model      tcn / stgcn（默认 stgcn）
+     --features   basic（仅 x,y,conf 3 通道）/ enhanced（增强 9 通道，推荐）
+     --window     滑窗长度，默认 30（应与推理一致）
+     --epochs     训练轮数，默认 50
+     --num_classes 分类数：2（正常/风险）或 3（正常/失衡/摔倒）
+     --fp_penalty score 里误报惩罚系数，越大越压制误报
+   预期输出：
+     Device: cuda
+     真实数据: N 个视频, M 帧, 3 类
+     增强特征: (17, 9)
+     Train: 100%|...| loss=0.xx acc=0.9x
+     Eval:  100%|...| loss=0.xx acc=0.8x
+     ...（每个 epoch 打印 Train/Eval 指标）
+     保存最佳模型 → ../checkpoints/best_model.pt
+     最终打印每类 Precision/Recall/F1 与 score。
+   产物：fall_detection/checkpoints/best_model.pt（内含 config、num_classes、model_type、f1 等元信息）+ best_model.metrics.json。
+
+2.超参网格搜索（search.py）
+   作用：遍历超参组合，按 score = avgF12 - fp_penalty*fp_rate 选最优，再重训。
+   命令：
+     python src\search.py --grid small --epochs 25 --final_epochs 100 --features enhanced
+   预期输出：每个组合的训练指标表格，最终用最优参数重训并保存 best_model.pt。
+
+3.评估已有模型（eval_model.py）
+   命令：
+     python src\eval_model.py --checkpoint ..\checkpoints\best_model.pt
+   预期输出：验证集规模、每类 P/R/F1、acc、macro_f1、avg_f12、fp_rate、score。
+   参考指标（当前最佳模型）：Accuracy 0.873，Macro F1 0.820，失衡类 F1 0.894，摔倒类召回 0.986。
+
+
+五、推理运行
+
+1.实时推理（demo_live.py）—— 摄像头 / 视频文件 / RTMP 网络流
+   命令（摄像头）：
+     python src\demo_live.py --checkpoint ..\checkpoints\best_model.pt
+   命令（RTMP 网络流，地址必须加引号）：
+     python src\demo_live.py --checkpoint ..\checkpoints\best_model.pt --video "rtmp://..." --profile
+   常用参数：
+     --infer_fps   推理采样帧率，默认 15（与训练一致，勿改）
+     --window      滑窗长度，默认 30（与训练一致，勿改）
+     --detect_every 人体检测间隔帧数，默认 1；调大（如 5）可提升帧率
+     --infer_width 推理检测分辨率宽度，2K 流建议 960/640 大幅提速
+     --profile     打印每帧读帧/检测/姿态/特征+分类/显示分段耗时
+     --play_only   只播放不推理（用于验证流与转码链路）
+   预期输出：
+     加载检测器...
+     加载姿态模型...
+     加载跌倒检测模型...
+     模型: STGCN, F1=0.8197, in_ch=9
+     视频源: rtmp://...，按 Q 退出
+     [profile] F:0 | 读帧: 4.1 | 检测: 46.3 | 姿态: 32.5 | 特征+分类: 2.0 | 显示: 1.2 | 合计: 86.1ms | FPS:11.6
+   （profile 每 30 帧打印一次，数值为累计平均；检测/姿态为最大头。）
+   画面效果：弹窗显示实时视频，人体上叠加 17 点骨架，底部为风险条（绿→黄→橙→红）与当前预警等级（SAFE/LOW_RISK/HIGH_RISK/IMMEDIATE），按 Q 退出。
+   说明：RTMP H.265 流若直接打不开，脚本会自动用 ffmpeg 转码为 H.264 再读，无需手动处理；流断线会自动重连。
+
+2.离线推理（infer.py）
+   作用：整段视频先提取关键点，再滑窗推理，生成带骨架+预警条的 result 视频。
+   命令：
+     python src\infer.py --checkpoint ..\checkpoints\best_model.pt --video ..\video\CGFM1.mp4
+   预期输出：逐帧进度条、每段风险分数与预警等级，保存 result/CGFM1_result.mp4（可用播放器打开核对）。
+
+3.批量检测（detect_videos.py）
+   作用：对 video/ 目录下所有视频批量跑推理，统一参数汇总结果。
+   命令：
+     python src\detect_videos.py --video_dir ..\video --checkpoint ..\checkpoints\best_model.pt
+   预期输出：每段视频的检测结果（风险分段、最高等级、耗时），并输出到 result/ 目录。
+
+
+六、Web 后端部署（CareWatch）
+
+后端有两种架构，二选一：
+方案 A：数据服务内置推理线程（一个进程搞定，适合演示）
+方案 B：数据服务 + 独立推理服务（数据服务保持轻量，推理单独进程，适合长时间部署）
+
+方案 A：内置推理
+1.确认 .env 配置（CareWatch-Backend-main\.env）：
+     ACTION_ENABLED=true
+     ACTION_VIDEO=            # 留空=摄像头；或填 rtmp:// 网络流 / 视频文件
+     ACTION_DEVICE=cuda
+   （若 .env 不存在，把 .env.example 复制为 .env 后修改。）
+2.启动后端（需在装有推理依赖的 conda 环境，即本说明的 python 环境）：
+     cd CareWatch-Backend-main
+     python run.py
+   预期输出：
+     Uvicorn running on http://0.0.0.0:8000
+     推理线程启动：加载检测器/姿态模型/跌倒模型
+     [action] 推理线程运行中（每 0.5s 落库 + 推送）
+3.验证：
+   - 打开 http://127.0.0.1:8000/docs 能看到全部接口文档（Swagger UI）。
+   - 浏览器打开 http://127.0.0.1:8000/video 直接显示实时标注的 MJPEG 视频流。
+   - 命令行测试 /api/status：
+     python -c "import urllib.request,json; print(json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/status')))"
+     预期返回字段：profile_id、online、fps、frame、state、risk_score、alert_level、probabilities、timestamp。
+
+方案 B：独立推理服务（数据服务不装 torch）
+1.数据服务在任意 Python 环境启动（仅需轻量依赖）：
+     cd CareWatch-Backend-main
+     pip install -r requirements.txt
+     python run.py
+   .env 配置：
+     ACTION_ENABLED=false
+     INFERENCE_SERVICE_URL=http://127.0.0.1:8100
+     MODEL_INGEST_KEY=mykey   # 数据上报密钥，与推理服务一致
+   预期输出：Uvicorn running on http://0.0.0.0:8000（不加载模型）。
+2.独立推理服务在装有推理依赖的 conda 环境启动：
+     python inference_server.py --video "rtmp://..." --checkpoint app/checkpoints/best_model.pt --api http://127.0.0.1:8000 --api-key mykey --port 8100
+   预期输出：推理服务启动、MJPEG 监听 8100、每 0.5s 打印上报结果（state/risk_score/alert_level）。
+   此时数据服务的 /video 会自动反向代理到推理服务的 8100，前端无需改地址。
+
+后端依赖（requirements.txt）：fastapi 0.115.6、uvicorn 0.34.0、sqlalchemy 2.0.37、pydantic-settings 2.7.1、python-multipart 0.0.20。
+数据库：首次启动自动创建 SQLite（carewatch.db），无需手动建库。
+
+
+七、前端部署（Website）
+
+1.安装依赖：
+     cd Website
+     npm install
+   预期输出：npm 下载依赖完成（约 1-2 分钟）。
+2.配置后端地址（Website\.env，可选，默认已指向 http://127.0.0.1:8000）：
+     VITE_ACTION_API=http://127.0.0.1:8000
+     VITE_DATA_API=http://127.0.0.1:8000
+3.启动开发服务器：
+     npm run dev
+   预期输出：
+     VITE v6.1.0 ready in 500 ms
+     Local: http://localhost:5173/
+4.浏览器打开 http://localhost:5173，应看到：
+   - 登录页：用后端注册的账号登录（首次可先注册）。
+   - 登录后进入「今日守护」看板。
+   - 进入「行动安全/跌倒监控」页：显示 /video 的实时视频流（带骨架与风险条）、当前风险分数、预警等级、历史记录。
+   - 进入「提醒中心」：可看到高风险自动生成的告警；「系统设置」可调整告警阈值（low/high/immediate）。
+5.生产构建：
+     npm run build
+   预期输出：生成 dist/ 目录（静态文件，可部署到任意静态服务器）。
+   说明：前端通过 WebSocket 接收实时推送（/ws?token=），并请求 /api/status、/api/history、/api/alerts 等接口。
+
+
+八、常见问题排查
+
+1.import mmpose/mmdet 报错：当前解释器不在装有 mmcv/mmdet/mmpose 的 conda 环境里。运行前先 conda activate <环境名>，或在 VS Code 里选中该环境的解释器。
+2.RTMP 流打不开：先确认地址加引号；H.265 流会走 ffmpeg 自动转码；也可把地址里的 supportH265=1 改为 0。用 --play_only 单独验证解码链路。
+3.实时推理卡在「视频源」后无窗口：多为旧版时间采样 bug（last_sample_t 初始化为 0），现版本已修复；若仍卡住，用 -u 无缓冲启动并查看最后输出定位。
+4.前端连不上后端：检查后端是否在 8000 端口、CORS_ORIGINS 是否含 http://localhost:5173、VITE_ACTION_API 是否正确。
+5.端口被占用：8000（后端）或 5173（前端）被占时，报 Address already in use，换端口或结束占用进程。
+6.训练效果对不上：确认训练与推理的 window（30）、infer_fps（15）、特征（enhanced 9 通道）三者一致。
+
+
+第二部分 系统设计与技术开发文档
+========================================
+
+
+一、总体架构与数据流
+
+系统为「端-边-云」三段式：算法端负责检测推理，后端负责落库/告警/推送，前端负责展示。
+
+数据流：
+  视频源（摄像头/文件/RTMP）
+    → RTMDet 人体检测（人体框 bbox）
+    → RTMPose 姿态估计（17 个 COCO 关键点 x,y,conf）
+    → 关键点归一化（髋居中 + 除身高）
+    → 增强特征（速度/重心/关节角/躯干倾角，3 通道 → 9 通道）
+    → 滑动窗口（window=30 @15fps ≈ 2 秒）
+    → 时序模型（STGCN / TCN）三分类概率（正常/失衡/摔倒）
+    → 状态机（连续确认 → SAFE/LOW_RISK/HIGH_RISK/IMMEDIATE）
+    → 双路输出：
+       实时标注帧 → /video MJPEG 流 → 前端展示
+       结果 → 落库(ActionEvent) → 按阈值生成告警(SystemAlert) → WebSocket 推送前端
+
+模块关系：
+  pose_mm（检测/姿态配置）→ fast_infer（快速前向+后处理）
+    → features（增强特征）→ stgcn/tcn（分类）
+    → state_machine（预警分级）
+    → demo_live（单机实时） / action_runner（后端线程） / inference_server（独立服务）
+
+
+二、模块设计与实现
+
+1.关键点提取（pose_mm.py / batch_extract.py）
+   输入：视频帧。
+   输出：(N,17,3) 关键点数组（17 点 COCO：鼻子、双眼、双耳、双肩、双肘、双腕、双髋、双膝、双踝）。
+   归一化规则（与训练严格一致）：以髋部中心为原点，坐标除以身高（头顶到脚踝），消除相机距离与身材差异。
+   批量提取用 batch_extract.py，模型只加载一次，避免重复加载开销。
+
+2.快速推理（fast_infer.py）
+   目的：绕开 mmdet/mmpose 高层 test_step/predict 的 Python 包装，只保留模型前向 + 手写紧凑后处理，显著降低每帧开销。
+   检测：RTMDet 输出 cls_scores/bbox_preds → filter_scores_and_topk → 解码 → NMS（参数收紧 nms_pre=1000、score_thr=0.3、max_per_img=100、iou_thr=0.65）。
+   姿态：RTMPose 取 simcc → head.decode → 坐标还原，公式与模型层逐字一致。
+   性能：检测约 185ms→46ms，姿态约 44ms→32ms（RTX 4070）。
+
+3.特征工程（features.py）
+   基础特征：原始 (x,y,conf) 3 通道。
+   增强特征（enhance_keypoints，推荐）9 通道：
+     0-2 原始坐标与置信度
+     3-4 关节速度 vx,vy（帧间差分）
+     5 关节相对重心角度
+     6 到重心距离
+     7 关节弯曲角
+     8 躯干倾角（跌倒时躯干由直立转水平，广播到所有关节）
+   增强特征提升视角鲁棒性与对失衡/倒地的区分能力。
+
+4.时序模型（stgcn_model.py / tcn_model.py）
+   ST-GCN（约 100 万参数）：空间图卷积（3 分区邻接矩阵聚合相邻关节）+ 时间卷积 + 残差，理解骨架结构。
+   TCN（约 38 万参数）：因果膨胀卷积（膨胀系数 1,2,4,8，感受野覆盖 31 帧），结构简单、实时性好。
+   两者均支持任意分类数，通过 predict_risk 输出风险分数。
+
+5.数据集（dataset.py）
+   滑动窗口切分：(N,17,C) → (window,17,C) 样本，stride 控制步长。
+   标签策略（label_tail 方案 2）：窗口标签只看最后 window//3 帧的最高等级，而非整窗 max。原因：避免「跌倒前整段正常姿态被窗口内未来跌倒污染」，让标签反映窗口尾部真实状态，报警更即时、假阳性更低。
+
+6.预警状态机（state_machine.py）
+   四级预警：SAFE → LOW_RISK → HIGH_RISK → IMMEDIATE。
+   基于三分类概率 [P0 正常, P1 失衡, P2 摔倒]，采用连续确认防误报：
+     LOW_RISK：P1>0.60 连续 3 次
+     HIGH_RISK：P1>0.75 连续 2 次
+     IMMEDIATE：P2>0.85 连续 5 次
+   阈值与连续次数均参数化，可在前端设置页或 /api/config 动态调整；告警判定实时使用数据库中的 RuntimeConfig。
+
+7.后端推理集成（action_runner.py / inference_server.py）
+   内置方案：FastAPI lifespan 启动后台推理线程，复用 demo_live 快速管线；每 0.5s 把最新结果交给 record_action 落库、判告警、WS 推送；最新标注帧写入共享区供 /video。
+   独立方案：推理单独进程，把结果 POST 到数据服务 /api/events/action（X-Model-Key 认证），自带 /video MJPEG；数据服务反向代理 /video。
+
+
+三、关键设计决策与技术要点
+
+1.训练/推理严格一致：归一化、增强特征、window=30、infer_fps=15 两端一致，否则离线指标与线上表现会脱节。
+2.FPS 统一：npy 不存 FPS 元数据，只体现在帧数 N 上；混合 25/30fps 源通过时间重采样统一到 15fps（关键点取区间起点帧、标签取区间 max，同一时间网格对齐）。
+3.误报压制：状态机从「单帧超阈值」改为「连续 N 帧确认」；训练指标 score 引入 fp_rate 惩罚，双管齐下控制假阳性。
+4.低延迟优先：fast_infer 只做单次前向（与训练一致），检测框可复用（detect_every）与推理分辨率缩放（infer_width）进一步提速，2K 大图场景效果明显。
+5.H.265 兼容：OpenCV 无 HEVC 解码，通过 ffmpeg relay 自动转码 H.264，保证 RTMP 网络流可用。
+
+
+四、API 接口设计
+
+认证类：
+  POST /api/auth/register  注册
+  POST /api/auth/login     登录（返回 token）
+  GET  /api/auth/me        当前用户
+  POST /api/auth/logout    登出
+
+跌倒检测类：
+  GET  /api/status         当前识别状态（online/fps/frame/state/risk_score/alert_level/probabilities）
+  GET  /api/history?limit  历史识别记录
+  GET  /video              MJPEG 实时视频流（前端 <img src> 直接显示）
+  WS   /ws?token=          实时推送识别结果
+
+告警阈值类：
+  GET  /api/config         读取阈值（low/high/immediate）
+  POST /api/config         修改阈值
+
+数据上报类：
+  POST /api/events/action  推理结果上报（独立推理服务用，X-Model-Key 认证）
+  POST /api/events/emotion 情绪记录
+  POST /api/events/environment 环境读数
+
+其他：
+  GET  /api/profile        被照护人档案
+  GET  /api/alerts         告警列表（unread_only 可过滤未读）
+  POST /api/alerts/{id}/read 标记已读
+  GET  /api/model/info     模型信息
+
+
+五、数据格式与模型
+
+1.关键点：data/keypoints/xxx_keypoints.npy，形状 (N,17,3)，N 为帧数，17 为关节，3 为 (x,y,conf)。
+2.标签：data/labels/xxx_labels.npy，形状 (N,)，取值 0=正常 1=失衡 2=摔倒。
+3.模型权重：checkpoints/best_model.pt，dict 结构，含 model（state_dict）、config（hidden/blocks 等）、num_classes、model_type、f1、epoch。
+4.评估指标（best_model.metrics.json）：
+   总指标：Accuracy 0.873、Macro F1 0.820、avg F1(失衡+摔倒) 0.774、误报率 0.304、score 0.622。
+   各类别：正常 P0.986/R0.846/F1 0.910；失衡 P0.866/R0.923/F1 0.894；摔倒 P0.491/R0.986/F1 0.655。
+   特点：摔倒类召回极高（0.986，漏检仅 5 帧），符合「宁可误报不可漏报」的目标。

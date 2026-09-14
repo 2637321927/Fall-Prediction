@@ -1,0 +1,71 @@
+# ============================================================
+# Fall-Prediction .gitignore
+# 原则：忽略「大体积产物」与「可再生成内容」，目录结构用 .gitkeep 保留
+# ============================================================
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ===== 第三方源码（只读克隆，见 README 获取方式） =====
+mmpose/
+third_party/
+
+# ===== 模型权重（体积大，见 checkpoints/README.md 分发方式） =====
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pth.tar
+work_dirs/
+outputs/
+
+# ===== 数据（体积大，可重新提取/下载） =====
+*.npy
+data/raw/**
+!data/raw/.gitkeep
+
+# ===== 视频 =====
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+
+# ===== 前端构建产物 =====
+dist/
+
+# ===== 临时脚本 =====
+setup_wsl*.sh
+wsl*.sh
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 其他 =====
+*.log
+*.tmp
+pip-wheel-metadata/

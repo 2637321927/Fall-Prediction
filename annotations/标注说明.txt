@@ -1,0 +1,70 @@
+按你们当前目标：只做视频 -> YOLO骨架 -> TCN跌倒预警，先把传感器类数据集排除。核心结论是：
+第一轮真正建议用的数据集只有 3 个：URFD、CAUCAFall、FallVision。
+其他数据集先不要让数据组处理，否则会乱。
+数据集怎么分
+数据集	是否符合视频骨架路线	自带标注情况	我们还要不要标注	建议
+URFD	符合	只有 fall / ADL 序列级标签，没有完整跌倒阶段	要标	小，先全量标
+CAUCAFall	很符合	有 fall / no-fall、逐帧图像/检测标注，但不是我们要的 risk/falling/fallen 阶段	要标	场景贴近居家/红外，重点标
+FallVision	很符合	已有 fall / no-fall 分类，而且每帧已有 17 点骨架 CSV	不全量标，只抽样补标	数据量很大，用已有标签，少量抽样标阶段
+UP-Fall	有视频但太重	多模态，850GB 级别	暂不标	先不碰
+KFall	主要是传感器，视频只是辅助	有 fall onset / impact	暂不作为视觉主训练	可参考它的时间点定义
+SisFall / UniMiB / Figshare传感器集	不符合当前视频路线	传感器标签	不标	暂时排除
+AnkFall	有视频但偏传感器/小规模	有风险动作概念	后面再说	非第一轮
+OmniFall	汇总类数据集	标签体系复杂	不让标注组先碰	后期做泛化测试
+来源上，URFD 官方说明有 30 段跌倒、40 段 ADL；CAUCAFall 官方说明有 5 类跌倒、5 类日常活动，并且是家庭非受控环境；FallVision 说明有 MP4 视频和每帧 17 关键点 CSV。
+参考：URFD、CAUCAFall、FallVision
+给数据处理组的明确任务
+第一轮只让他们处理：
+1. URFD：全量处理
+2. CAUCAFall：全量或至少大部分处理
+3. FallVision：不全量人工标，只做抽样补标
+他们要交付两类东西。
+第一类：视频清单 video_manifest.csv
+video_id,dataset,file_name,is_fall,scenario,camera_view,fps,crop_mode,quality,notes
+urfd_fall_001,URFD,fall-01-cam0.mp4,1,standing_fall,front,30,right-half,good,left depth + right RGB
+cauca_fall_001,CAUCAFall,S01_forward_fall.avi,1,forward_fall,corner,23,none,good,home infrared
+fallvision_001,FallVision,xxx.mp4,1,standing_fall,front,30,none,good,has keypoint csv
+第二类：跌倒事件时间点 fall_events.csv
+video_id,dataset,file_name,risk_start_frame,fall_start_frame,impact_frame,stable_fallen_frame,quality,notes
+urfd_fall_001,URFD,fall-01-cam0.mp4,72,96,128,160,good,side fall
+cauca_fall_001,CAUCAFall,S01_forward_fall.avi,60,82,110,145,good,forward fall
+normal_001,CAUCAFall,S01_walk.avi,,,,,good,normal activity
+标注定义
+他们只需要标 4 个时间点：
+risk_start_frame：
+开始出现明显失衡风险，比如身体异常前倾/后仰/侧倾、脚步补偿失败、重心明显偏移。
+
+fall_start_frame：
+已经开始不可恢复地下坠，身体明显进入跌倒过程。
+
+impact_frame：
+身体首次接触地面/床/椅子等承托物。
+
+stable_fallen_frame：
+倒地后姿态基本稳定，不再明显移动。
+正常视频不用填这四个字段，全部留空。
+是否先提骨架再标注
+推荐顺序是：
+1. 数据组先整理视频和现有标签
+2. 数据组看原始视频标 fall_events.csv
+3. 算法组用 YOLO 批量提骨架
+4. 算法组根据 fall_events.csv 自动生成 normal / risk / falling / fallen 标签
+5. 算法组切滑动窗口训练 TCN
+也就是说：标注组不需要跑 YOLO。
+但我们可以给他们生成带骨架的视频作为辅助参考。最终标注仍然以原始视频为准，不以 YOLO 骨架为准。
+大数据量怎么处理
+FallVision 很大，不建议全量人工标。处理策略是：
+FallVision：
+直接使用它已有的 fall/no-fall 分类和关键点 CSV。
+只抽样补标，比如每类 100-200 个视频：
+standing fall
+chair fall
+bed fall
+standing no-fall
+chair no-fall
+bed no-fall
+URFD 和 CAUCAFall 数据量小很多，建议认真标完整阶段。它们会成为你们第一版 risk / falling / fallen 的干净样本。
+最终给数据组的一句话需求
+你们可以这样跟数据组说：
+第一轮只处理 URFD、CAUCAFall、FallVision。URFD 和 CAUCAFall 的跌倒视频需要人工标注 risk_start_frame / fall_start_frame / impact_frame / stable_fallen_frame；正常视频只需确认是 normal。FallVision 数据量太大，不全量标注，只使用已有 fall/no-fall 和关键点 CSV，并抽样补标一部分跌倒阶段。标注组不需要跑 YOLO，只交付视频清单和事件时间点 CSV。
+

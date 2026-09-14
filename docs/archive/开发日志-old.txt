@@ -1,0 +1,228 @@
+防跌倒人体检测项目开发日志
+
+记录项目从零到可用的完整开发过程，按时间线整理方案设计、实验测试、问题排查与版本迭代。
+依据项目内代码、git提交、模型指标与数据产物整理，记录均为实际发生的工作内容。
+
+
+一、项目概述
+
+目标：基于视频的人体跌倒检测与分级预警（正常/失衡/摔倒），并支撑Web/移动端实时监控。
+技术路线：视频帧→RTMDet人体检测→RTMPose骨架关键点提取（17点COCO）→滑动窗口时序建模（TCN/ST-GCN）→状态机四级预警（SAFE/LOW/HIGH/IMMEDIATE）。
+核心产物：
+  1.数据流水线：关键点提取、交互式标注、标签转换、FPS统一重采样
+  2.模型训练/推理：train.py、search.py（超参搜索）、eval_model.py、fast_infer.py
+  3.实时服务：demo_live.py（本地实时推理）→server.py/CareWatch-Backend-main（HTTP/WS服务）
+环境：openmmlab conda环境（PyTorch 2.0.1+cu118、mmcv 2.1.0、RTX 4070 Laptop），mmpose源码开发模式。
+
+
+二、版本迭代总览
+
+版本    时间                内容
+v0.1    2026-08-04~08-05    初始框架：RTMPose+ST-GCN/TCN，摄像头demo
+v0.2    2026-08-06          实时推理demo_live、多事件标注、批量提取、4分类支持
+v0.3    2026-08-07~08-08    多数据集接入、归一化对齐、增强特征、URFD预处理
+v0.4    2026-08-11~08-13    URFD/Pre-VFall数据、关键点一致性校验、离线推理
+v0.5    2026-08-19~08-24    Web API服务：HTTP+WebSocket+MJPEG视频流
+v0.6    2026-08-24~08-25    推理性能优化：fast_infer低延迟管线
+v0.7    2026-08-25          推理服务迁移接入CareWatch后端（落库/告警/推送）
+v0.8    2026-08-26          数据FPS统一、状态机调参、最终模型训练与评估
+v0.9    2026-08-27~08-28    批量检测、前后端联调收尾
+
+
+三、阶段0：环境搭建与方案设计（~2026-08-04）
+
+关键节点
+1.搭建openmmlab conda环境，安装PyTorch 2.0.1（CUDA 11.8）+mmcv 2.1.0+mmdet+mmpose，mmpose以源码开发模式挂载在工作区，便于追踪模型层行为。
+2.调研公开跌倒数据集，确定第一轮仅用3个符合「视频→骨架→时序分类」路线的数据集：
+   - URFD：30段跌倒+40段ADL，有序列级标签，需补标阶段
+   - CAUCAFall：家庭非受控环境，5类跌倒+5类日常，需补标
+   - FallVision：自带每帧17点骨架CSV，仅抽样补标
+   传感器类数据集（SisFall/UniMiB/KFall等）排除出视觉主训练路线；KFall仅参考其时间点定义。
+3.约定4个关键时间点标注定义：
+   - risk_start_frame：失衡开始（身体异常前倾/后仰/侧倾、重心明显偏移）
+   - fall_start_frame：不可恢复下坠，身体明显进入跌倒过程
+   - impact_frame：首次触地（地面/床/椅子等承托物）
+   - stable_fallen_frame：倒地后姿态基本稳定
+
+技术选型
+- 检测：RTMDet（小模型、速度快）；姿态：RTMPose-m（256x192）。
+- 时序模型：TCN（约38万参数，因果膨胀卷积，实时性好）与ST-GCN（约100万参数，空间图卷积理解骨架结构）双路线对比。
+
+
+四、阶段1：第一版框架（2026-08-04~08-05）
+
+关键节点
+1.创建fall_detection项目骨架，先实现stgcn_model.py（SpatialGraphConv三分区策略+时间卷积+残差）与pose_vis.py（COCO17点骨架绘制）。
+2.08-05下载RTMPose-m权重与配置到checkpoints/；补充tcn_model.py（膨胀系数1,2,4,8，感受野覆盖31帧）与demo_webcam.py（早期摄像头demo）。
+3.首次git提交（1d73f9a）：init: MMPose/RTMPose+TCN/ST-GCN fall detection framework。
+
+说明
+- 输入约定（B,T,J,C）=（batch,窗口,17,3）（x,y,confidence）。
+- ST-GCN邻接矩阵采用可学习参数并初始化对角线为1（保证自身连接）。
+
+
+五、阶段2：实时推理与数据工具（2026-08-06~08-08）
+
+关键节点
+1.08-06提交（56b42d4）：add: demo_live real-time inference, label_video multi-event, batch_extract, 4-class support
+   - demo_live.py：摄像头/视频文件实时推理，滑动窗口缓冲区，FPS显示，预处理与训练完全一致。
+   - label_video.py：交互式标注工具，支持多段事件（R/F/I/S标记4个时间点）、删除、逐帧定位，输出3分类标签+*_info.json。
+   - batch_extract.py：批量关键点提取，模型只加载一次，按源目录镜像输出。
+2.08-07提交（ab91906）：fix: MultiVideoDataset multi-class, remove test data, enhanced features support——支持多视频、多分类；移除测试数据。
+3.08-08提交（3aa7903）：fix:归一化对齐、推理修复、新增README文档——关键点归一化逻辑与推理对齐（髋居中+除身高），补充src/README.md模块职责说明。
+4.08-08 crop_urfd.py：URFD左右拼接画面裁剪为仅保留左半深度图；Fall_sequences数据就位。
+5.08-08 export_data.py：把fall-01关键点导出为文本+骨架动画gif到version/，用于人工核验数据质量。
+
+
+六、阶段3：URFD/Pre-VFall数据与离线推理（2026-08-11~08-13）
+
+关键节点
+1.08-12 compare_keypoints.py：对关键点提取结果做一致性校验，排查提取流程差异。
+2.08-13 convert_prevfall_labels.py：Pre-VFall官方CSV（抽帧标签）→前向填充到30fps→*_labels.npy；Normal/Abnormal段按视频合并，重叠帧取较高类别（宁可误报不可漏报）。
+3.08-13 infer.py：离线推理管线——先整段提取关键点→滑动窗口推理→生成带骨架+预警条的result/*_result.mp4，用于批量验证模型效果。
+4.08-13训练src/checkpoints/best_model.pt（此版本为早期3通道基础特征模型）。
+
+实验测试
+- 用URFD fall-01等样本走通「提取→标注→训练→推理→可视化」全链路，验证骨架动画与预警条渲染正确。
+
+
+七、阶段4：Web API服务（2026-08-19~08-24）
+
+关键节点
+1.08-19 server.py：第一个HTTP/WS服务，提供/api/status、/api/history、/api/config、/ws（WebSocket实时推送）、/video（MJPEG视频流）。
+2.docs/API.md：编写完整接口文档（字段、示例、阈值配置）。
+3.08-24补充text_labels_to_npy.py（文本标签→npy）、low_level_infer.py（低层推理接口封装）、更新pose_mm.py。
+
+问题排查与解决
+1.RTMP H.265流无法解码：OpenCV无HEVC解码能力。解决：demo_live.py中自动启动imageio-ffmpeg relay，把H.265拉流转码为H.264（tcp本地端口输出）再交给OpenCV；支持--play_only单独验证解码链路，避免误判「流坏了」。
+2.网络流地址含&?=会被shell截断（PowerShell中&是命令分隔符）：要求整条地址加引号，并在脚本注释中说明。
+
+
+八、阶段5：推理性能优化fast_infer（2026-08-24~08-25）
+
+关键节点
+- 08-25完成fast_infer.py：绕开mmdet/mmpose高层test_step/predict的Python后处理包装，只保留模型前向（mode='tensor'）+手写紧凑后处理：
+  1.检测：cls_scores/bbox_preds→filter_scores_and_topk→解码→NMS。参数收紧（nms_pre=1000、score_thr=0.3、max_per_img=100、iou_thr=0.65）。
+  2.姿态：pose_model（inputs,ds,mode='tensor'）拿simcc→head.decode→坐标还原，与mmpose模型层add_pred_to_datasample逐字一致（kpts/input_size*bbox_scales+bbox_centers-0.5*bbox_scales，分母用192/256不减1）。
+
+实验测试
+- 耗时对比：检测185ms→约46ms；姿态约44ms→约32ms。
+- compare_fast.py一致性回归：fast管线vs低层API对齐，bbox<3px、kpts<5px→PASS。
+- 遗留说明：关键点仍差约3.6px，来自旧链路predict里的flip_test（TTA）双前向融合，fast改为单次前向（与训练一致）；960x540上约0.3%，阈值5px可忽略。
+
+问题排查与解决
+- 检测2K大图慢（1440x2560每帧约1.7s）：用--detect_every 5复用bbox，或--infer_width缩放输入。
+
+
+九、阶段6：接入CareWatch后端（2026-08-25）
+
+关键节点
+1.将推理模块整体迁移到CareWatch-Backend-main/app/action/（fast_infer/features/pose_mm/pose_vis/state_machine/stgcn/tcn），权重放到app/checkpoints/。
+2.新增action_runner.py：demo_live快速管线后台线程，每0.5s经routes.record_action落库、生成告警、WebSocket推送，并提供最新帧供/video。
+3.routes.py新增record_action()（与/api/events/action共用）与GET /video（MJPEG）。
+4.main.py lifespan增加start/stop推理；config.py增加action_*配置；MODEL_INGEST_KEY鉴权配置。
+5.冒烟测试通过：注册/登录/status/history/config/events/action（risk0.9→IMMEDIATE告警）/alerts/model_info。
+
+问题排查与解决
+- 环境不统一导致推理不可用：确保在openmmlab环境运行run.py（已装fastapi/sqlalchemy/uvicorn/httpx），ACTION_ENABLED=false可关闭推理单独调试后端。
+
+
+十、阶段7：数据统一与FPS对齐（2026-08-26）
+
+关键节点
+1.FPS统一约定：npy只存（N,17,3）关键点坐标，不含FPS元数据；FPS只体现在帧数N上。
+2.resample_labels.py（扩展含resample_keypoints）：混合25/30fps源按浮点比例时间重采样统一到15fps；关键点取区间起点帧（不插值避免伪姿态）、标签取区间内最高等级；同一时间网格保证对齐；先--dry_run预览再覆盖写盘。
+3.demo_live.py增加--infer_fps 15时间采样匹配训练（固定步进采样点，源25/30/16fps都精确到约15fps）。
+4.训练/推理一致参数：window=30@15fps约等于2秒（train.py默认window=30无需改）。
+5.make_labels_from_xlsx.py：从标注xlsx（起始帧+状态分段）生成帧级labels.npy，支持多标注文件批量转换。
+
+实验测试（标签策略）
+- 对比整窗max与「窗口尾部max」两种标签策略：
+  - 整窗max会把「跌倒前整段正常姿态」提前污染为异常，导致报警提前、假阳性升高。
+  - 最终采用label_tail（方案2）：窗口标签只看最后window//3帧的最高等级，让标签反映窗口尾部真实状态，报警更即时。
+
+问题排查与解决（重大Bug）
+- demo_live时间采样死循环：last_sample_t初始化为0，与绝对时间戳（约1.7e9）比较→while死循环约260亿次，卡在imshow之前、窗口不弹出。
+  - 症状特征：完整模式打印「视频源」后卡死无窗口，但--play_only正常（它走continue跳过采样逻辑）。
+  - 修复：last_sample_t初始化为time.time()-sample_interval。
+  - 经验：RTMP流本身正常时demo_live卡住先怀疑自己的代码，用-u无缓冲或kill后看输出定位。
+
+
+十一、阶段8：状态机调参与最终模型（2026-08-26）
+
+关键节点
+1.state_machine.py：阈值/连续确认次数全部参数化（low/high/imm thresh+count），支持2分类分数、3分类概率、类别整数三种输入。
+2.防误报调参：原IMMEDIATE单次>0.85误报多，放宽为连续确认：
+   - LOW_RISK：P1>0.60连续3次
+   - HIGH_RISK：P1>0.75连续2次
+   - IMMEDIATE：P2>0.85连续5次
+3.features.py增强特征enhance_keypoints（方案B）：3通道→9通道
+   - 0-2原始x,y,conf；3-4速度vx,vy；5关节相对重心角度；6到重心距离；7关节弯曲角；8躯干倾角（广播，跌倒时躯干由直立转水平）。
+4.search.py：网格搜索+动态调参，按score=avgF12-fp_penalty*fp_rate（兼顾不稳/摔倒精确率并惩罚误报）选最优超参后重训。
+5.08-26 23:17训练最终checkpoints/best_model.pt（in_ch=9，3分类）。
+
+实验测试（最终模型评估，best_model.metrics.json）
+总指标：
+  Accuracy  0.873
+  Macro F1  0.820
+  avg F1（失衡+摔倒）  0.774
+  误报率fp_rate    0.304
+  score     0.622
+
+各类别指标：
+  类别     Precision  Recall  F1     TP    FP    FN
+  0正常    0.986      0.846   0.910  2447  36    447
+  1失衡    0.866      0.923   0.894  743   115   62
+  2摔倒    0.491      0.986   0.655  350   363   5
+
+结论：摔倒类召回极高（0.986，漏检仅5帧）符合「宁可误报不可漏报」的目标；正常类误报率低；失衡类F1 0.894。摔倒类误报（FP 363）主要由失衡/正常被误判为摔倒导致，后续通过状态机连续确认压制。
+
+
+十二、阶段9：批量检测与联调收尾（2026-08-27~08-28）
+
+关键节点
+1.08-27 detect_videos.py：对video/目录批量跑跌倒检测推理，统一--infer_fps 15、--window 30、--detect_every 5、--infer_width 960，汇总输出每段结果。
+2.08-28同步CareWatch后端app/action/state_machine.py阈值（与本地fall_detection/src保持同一份逻辑）；完善routes.py/action_runner.py。
+3.前端Website/新增FallMonitor.vue（跌倒监控页），对接/api/status（profile_id/online/fps/frame/state/risk_score/alert_level/probabilities）；dist/构建产物生成。
+
+
+十三、常见问题与踩坑记录（汇总）
+
+现象                                根因                                  解决
+RTMP H.265流打不开                  OpenCV无HEVC解码                      imageio-ffmpeg relay转码H.264再读
+demo_live打印视频源后卡死无窗口      last_sample_t=0与绝对时间戳比较        初始化为time.time()-interval
+                                    触发while死循环
+训练/推理效果对不上                  训练25/30fps、推理不同步              统一时间重采样到15fps+window=30
+整窗max标签导致报警提前              正常帧被窗口内未来跌倒污染             改用窗口尾部label_tail帧max
+IMMEDIATE单帧误报多                  阈值只判单次                          改为连续5次>0.85确认
+关键点坐标差约3.6px                  旧链路flip_test TTA双前向             fast单前向（与训练一致），阈值5px容忍
+2K大图检测慢（1.7s/帧）              RTMDet处理大图开销大                  --detect_every 5复用bbox/--infer_width缩放
+VS Code报mmpose/mmdet import错误     默认解释器非openmmlab环境             忽略误报，实际运行用openmmlab解释器
+自动化终端含&/$env:命令异常          终端^U注入问题                        用无引号直接路径或TestClient脚本
+
+
+十四、技术栈与目录速查
+
+fall_detection/
+  src/
+    pose_mm.py                关键点提取（RTMDet+RTMPose，归一化）
+    batch_extract.py          批量提取
+    label_video.py            交互式标注（多事件）
+    crop_urfd.py              URFD预处理
+    convert_prevfall_labels.py  Pre-VFall CSV标签转换
+    make_labels_from_xlsx.py  标注xlsx→帧级标签
+    resample_labels.py        关键点/标签时间重采样（FPS统一）
+    dataset.py                滑动窗口切分（label_tail方案2）
+    features.py               增强特征（3→9通道）
+    stgcn_model.py / tcn_model.py   时序模型
+    train.py / search.py / eval_model.py   训练/搜索/评估
+    fast_infer.py             低延迟推理（检测46ms/姿态32ms）
+    compare_fast.py           fast vs低层API一致性回归
+    demo_live.py              实时推理（含ffmpeg relay/时间采样）
+    infer.py / detect_videos.py   离线/批量推理
+    state_machine.py          四级预警状态机
+    server.py                 早期HTTP/WS服务
+  data/{keypoints,labels}/    关键点+标签（URFD/CAUCAFall/Pre-VFall等）
+  checkpoints/                模型权重+RTMPose配置+指标
+  docs/API.md                 接口文档
+  video/ + result/            待测视频+推理结果
